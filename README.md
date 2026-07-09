@@ -1,120 +1,109 @@
-# obsidian-headless in Docker
+# obsidian-sync
 
-Runs [Obsidian Sync](https://obsidian.md/help/headless) headlessly in a
-container — no Node or desktop app on the host. Wraps the beta
-`obsidian-headless` package (binary: `ob`). Requires an active Obsidian Sync
+Headless [Obsidian Sync](https://obsidian.md/help/headless) in Docker — no Node
+or desktop app on the host, and no docker-compose. A single self-contained
+script (`obsidian-sync`) builds the image, manages one container per vault, and
+wraps the beta `obsidian-headless` CLI (`ob`). Requires an active Obsidian Sync
 subscription.
 
-One image serves any number of vaults. Each vault is an independent Compose
-*project* (`-p <name>`) with its own isolated config volume, login, and E2EE
-key — so you never edit a shared file to add one.
+## Model
 
-## Build the image (once)
+- **One vault per project directory.** Each project keeps its vault in `./wiki`,
+  and the remote vault is named after the project directory.
+- **Per-project isolation.** State (login, E2EE key, sync db) lives in
+  `~/.config/obsidian-sync/<project>` — a host directory outside the project, so
+  keys never land in a project's own git repo. The container is
+  `obsidian-sync-<project>`.
+- **No entrypoint, no root.** The container runs as your uid via `docker run
+  --user`, so files it writes to the vault are owned by you and the config
+  directory needs no chown.
+- **Image built on demand.** First run builds `obsidian-sync:<version>` from a
+  Dockerfile embedded in the script, then reuses it.
 
-```bash
-cp .env.example .env     # set PUID/PGID to `id -u` / `id -g`
-docker compose build     # produces obsidian-headless:0.0.12, reused by every project
-```
+Put `obsidian-sync` on your `PATH` (e.g. symlink into `~/.local/bin`).
 
-`.env` holds only the shared constants (`PUID`, `PGID`, `OB_VERSION`). The
-per-vault path is supplied per project, below.
+## Set up a vault
 
-## Add a vault
-
-A project is defined by two variables. Set them in your shell (or keep them in a
-per-project file and `source` it):
-
-```bash
-export COMPOSE_PROJECT_NAME=whoop                            # names the container + volume
-export VAULT_PATH=/home/jrozner/vuln-research/whoop/wiki     # the host vault directory
-```
-
-`COMPOSE_PROJECT_NAME` is the env-var form of `-p`: with it set, every
-`docker compose` command below targets this project and its own
-`whoop_obsidian-config` volume. Then run the one-time setup — the first three
-are interactive:
+From the project directory (or point at it with `-C <dir>`):
 
 ```bash
-# 1. Log in (prompts for email, password, 2FA) — once per project, since the volume is isolated
-docker compose run --rm obsidian-sync ob login
-
-# 2. Create the remote vault (prompts for an E2EE password — save it)
-docker compose run --rm obsidian-sync ob sync-create-remote --name "whoop" --encryption e2ee
-
-# 3. Link the local vault to it (re-enter the same E2EE password)
-docker compose run --rm obsidian-sync ob sync-setup --vault "whoop"
-
-# 4. First sync (non-interactive from here on)
-docker compose run --rm obsidian-sync ob sync
-
-# 5. Start the continuous daemon
-docker compose up -d
+cd ~/vuln-research/whoop      # vault is ~/vuln-research/whoop/wiki
+obsidian-sync setup
 ```
 
-If the remote vault already exists, skip step 2 and use
-`ob sync-list-remote` to find its name for step 3.
+`setup` walks the one-time flow, skipping steps already done:
 
-To add another vault, open a fresh shell, set the two variables to new values,
-and run the same steps. Nothing shared is edited; the projects are fully
-independent (`acme_obsidian-config`, `acme-obsidian-sync-1`, …).
+1. **login** — email, password, 2FA (interactive)
+2. **create remote** — E2EE vault named after the directory; you choose a
+   password (interactive). Skipped if a remote with that name exists.
+3. **link** — connect `./wiki` to the remote; re-enter the E2EE password.
+4. **first sync**, then starts the continuous daemon.
 
-> Set `COMPOSE_PROJECT_NAME` **consistently** for a given vault. If it's unset,
-> Compose falls back to the directory name (`obsidian`) and every command hits
-> one shared volume — silently defeating the isolation.
-
-`restart: unless-stopped` brings each daemon back after a reboot.
+Save the E2EE password: it's your only recovery secret and what you re-enter on
+another device.
 
 ## Everyday use
 
-Set `COMPOSE_PROJECT_NAME` (and `VAULT_PATH` for commands that touch the vault)
-first, then:
+All commands take an optional `-C <dir>` (default: current directory).
 
 ```bash
-docker compose logs -f                                # follow this project's daemon
-docker compose down          / up -d                  # stop / start this project
-docker compose run --rm obsidian-sync ob sync-status  # what's linked
-docker compose run --rm obsidian-sync ob sync         # one-shot sync
-docker compose run --rm obsidian-sync ob --help       # full CLI
+obsidian-sync start          # start / resume the daemon (restart=unless-stopped)
+obsidian-sync stop           # stop + remove the container (state kept)
+obsidian-sync logs           # follow the daemon
+obsidian-sync status         # ob sync-status
+obsidian-sync sync           # one-shot sync
+obsidian-sync purge          # stop + delete this project's config (not the vault)
 ```
 
-Anything after `obsidian-sync` is passed straight to `ob`.
-
-**Pull-only / backup server** (never push local edits):
+Arbitrary CLI passthrough (TTY only when interactive, so it works in cron too):
 
 ```bash
-docker compose run --rm obsidian-sync ob sync-config --mode pull-only      # ignore local edits
-docker compose run --rm obsidian-sync ob sync-config --mode mirror-remote  # revert local edits
+obsidian-sync ob sync-list-remote
+obsidian-sync ob sync-config --mode pull-only      # backup box: ignore local edits
+obsidian-sync ob sync-config --mode mirror-remote  # backup box: revert local edits
 ```
 
-## Things to know
+## Adding more vaults
 
-- **Each project has its own config volume** (`<project>_obsidian-config`),
-  holding that vault's `auth_token`, E2EE key, and sync state
-  (`sync/<vaultId>/state.db`). Isolation is the point: one compromised or deleted
-  volume affects only its vault. The cost is one `ob login` per project.
-- **The E2EE key lives in that volume.** For unattended sync the container must
-  decrypt without you, so `sync-setup` stores the derived key there. Whoever can
-  read the volume can read the vault — keep it on encrypted disk. The password is
-  still your recovery secret and what you re-enter on another device; don't lose it.
-- **Back up the config volume, not just the vault.** Lose it and you redo login +
-  `sync-setup`, and the next sync re-scans everything.
-- **`PUID` must match the vault owner.** The container never chowns `/vault`, so a
-  mismatch is `Permission denied` on first write. Check with
-  `stat -c '%u:%g' "$VAULT_PATH"`.
-- **Don't run two continuous syncs on one vault** — same rule as the desktop app
-  plus this container against the same directory. (Separate vaults are fine; the
-  sync lock lives inside each vault at `.obsidian/.sync.lock`.)
-- **No file-creation-time preservation on Linux** (upstream ships that native
-  addon only for macOS/Windows). Sync is otherwise unaffected.
-
-## Upgrading
-
-`obsidian-headless` is 0.0.x beta — pinned via `OB_VERSION` in `.env`. Bump deliberately:
+Repeat `setup` in each project directory. Every vault is independent —
+own container, own config directory, own login and E2EE key. Nothing shared is
+edited.
 
 ```bash
-curl -s https://registry.npmjs.org/obsidian-headless | \
-  python3 -c 'import sys,json; print(json.load(sys.stdin)["dist-tags"])'   # latest version
-# edit OB_VERSION in .env, rebuild the shared image, then restart each project:
-docker compose build
-COMPOSE_PROJECT_NAME=whoop VAULT_PATH=... docker compose up -d
+obsidian-sync -C ~/vuln-research/acme setup
 ```
+
+## Updating
+
+The image definition lives in the script's `build_image()` function.
+
+- **Bump `obsidian-headless`:** run with a new version, which builds and tags a
+  fresh image; then restart the daemon.
+
+  ```bash
+  # latest published version:
+  curl -s https://registry.npmjs.org/obsidian-headless | \
+    python3 -c 'import sys,json; print(json.load(sys.stdin)["dist-tags"])'
+
+  OB_VERSION=0.0.13 obsidian-sync -C ~/vuln-research/whoop restart
+  ```
+
+  Or change the `OB_VERSION` default at the top of the script.
+
+- **Bump the base image** (Node/Alpine): edit the `FROM node:22-alpine` line in
+  `build_image()`, then `obsidian-sync build` and `restart`.
+
+## Notes
+
+- **The E2EE key sits in `~/.config/obsidian-sync/<project>`.** For unattended
+  sync the container must decrypt without you, so the derived key is stored
+  there. Whoever can read that directory can read the vault — keep it on
+  encrypted disk. Back it up: lose it and you redo login + link, and the next
+  sync re-scans the vault.
+- **Run as the vault's owner.** The container writes to the vault as your uid; if
+  the `wiki` directory is owned by someone else the script warns and writes will
+  fail.
+- **Don't run two continuous syncs on one vault** (this daemon plus the desktop
+  app against the same directory). Separate vaults are fine.
+- **No file-creation-time preservation on Linux** — upstream ships that native
+  addon only for macOS/Windows; sync is otherwise unaffected.

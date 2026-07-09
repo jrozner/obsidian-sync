@@ -1,2 +1,0 @@
-# Machine-specific config (vault path, PUID/PGID). Use .env.example as the template.
-.env
