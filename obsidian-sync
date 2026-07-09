@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# obsidian-sync — headless Obsidian Sync in Docker, without docker-compose.
+#
+# Convention: each project directory holds its vault in ./wiki, and the remote
+# vault is named after the project directory. All per-project state (login,
+# E2EE key, sync db) lives under ~/.config/obsidian-sync/<project> — outside the
+# project dir, so it never lands in a project's git repo.
+#
+# Usage: obsidian-sync [-C <dir>] <command> [args]
+#
+#   setup     one-time: log in, create + link the remote, first sync, start daemon
+#   start     start (or resume) the continuous-sync daemon
+#   stop      stop and remove the daemon container (state is kept)
+#   restart   stop then start
+#   status    show sync status (ob sync-status)
+#   sync      run a one-shot sync
+#   logs      follow the daemon's logs
+#   login     (re)authenticate this project
+#   ob ...    run an arbitrary ob command (e.g. ob sync-config --mode pull-only)
+#   build     (re)build the image
+#   purge     stop the daemon and DELETE this project's config (login/key/state)
+#
+# -C <dir> selects the project directory (default: current directory).
+# OB_VERSION env var pins the CLI version (default below).
+
+set -euo pipefail
+
+OB_VERSION="${OB_VERSION:-0.0.12}"
+IMAGE="obsidian-sync:${OB_VERSION}"
+CONFIG_ROOT="${OBSIDIAN_SYNC_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/obsidian-sync}"
+
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+info() { printf '\033[36m==>\033[0m %s\n' "$*" >&2; }
+
+command -v docker >/dev/null 2>&1 || die "docker not found on PATH"
+
+build_image() {
+  info "building $IMAGE"
+  local tmp; tmp="$(mktemp -d)"
+  # Unquoted heredoc: $OB_VERSION expands here, at build time.
+  cat > "$tmp/Dockerfile" <<EOF
+FROM node:22-alpine
+RUN apk add --no-cache ca-certificates \\
+ && npm install -g --omit=dev "obsidian-headless@$OB_VERSION" \\
+ && npm cache clean --force
+ENV XDG_CONFIG_HOME=/config HOME=/config
+WORKDIR /vault
+ENTRYPOINT ["ob"]
+EOF
+  docker build -t "$IMAGE" "$tmp"
+  rm -rf "$tmp"
+}
+
+ensure_image() { docker image inspect "$IMAGE" >/dev/null 2>&1 || build_image; }
+
+# Resolve project context from a directory. Sets: PROJECT VAULT CFG CONTAINER USER_SPEC
+load_project() {
+  local dir; dir="$(cd "${1:-$PWD}" 2>/dev/null && pwd)" || die "no such directory: ${1:-$PWD}"
+  PROJECT="$(basename "$dir")"
+  VAULT="$dir/wiki"
+  CFG="$CONFIG_ROOT/$PROJECT"
+  CONTAINER="obsidian-sync-$PROJECT"
+  USER_SPEC="$(id -u):$(id -g)"
+  mkdir -p "$VAULT" "$CFG"
+  local owner; owner="$(stat -c '%u' "$VAULT")"
+  [ "$owner" = "$(id -u)" ] || \
+    info "warning: $VAULT is owned by uid $owner but you are uid $(id -u); vault writes may fail — run as the vault owner"
+}
+
+_run() {  # $1: it|no (allocate a TTY?), rest: ob args
+  ensure_image
+  local flags=(--rm --user "$USER_SPEC" -v "$CFG:/config" -v "$VAULT:/vault")
+  [ "$1" = it ] && flags+=(-it); shift
+  docker run "${flags[@]}" "$IMAGE" "$@"
+}
+ob_it()   { _run it "$@"; }                              # interactive (login / setup prompts)
+ob_run()  { _run no "$@"; }                              # non-interactive (sync / status)
+ob_auto() { if [ -t 0 ]; then _run it "$@"; else _run no "$@"; fi; }  # passthrough: TTY if we have one
+
+running() { [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || echo false)" = true ]; }
+exists()  { docker inspect "$CONTAINER" >/dev/null 2>&1; }
+
+cmd_start() {
+  ensure_image
+  if running; then info "$CONTAINER already running"; return; fi
+  exists && docker rm -f "$CONTAINER" >/dev/null
+  docker run -d --name "$CONTAINER" --restart unless-stopped \
+    --user "$USER_SPEC" -v "$CFG:/config" -v "$VAULT:/vault" \
+    "$IMAGE" sync --continuous >/dev/null
+  info "started $CONTAINER (continuous sync) — follow with: logs"
+}
+
+cmd_stop() {
+  if exists; then docker rm -f "$CONTAINER" >/dev/null; info "stopped $CONTAINER"; else info "$CONTAINER not running"; fi
+}
+
+cmd_logs() { exists || die "$CONTAINER does not exist — run 'start' first"; docker logs -f "$CONTAINER"; }
+
+cmd_setup() {
+  info "project '$PROJECT'   vault=$VAULT   config=$CFG"
+  ensure_image
+
+  info "1/4 login (interactive; already-logged-in just prints status)"
+  ob_it login
+
+  if ob_run sync-list-remote 2>/dev/null | grep -q "\"$PROJECT\""; then
+    info "2/4 remote vault '$PROJECT' already exists — skipping create"
+  else
+    info "2/4 create remote vault '$PROJECT' (E2EE — choose a password and save it)"
+    ob_it sync-create-remote --name "$PROJECT" --encryption e2ee
+  fi
+
+  if ob_run sync-status 2>/dev/null | grep -q 'Vault:'; then
+    info "3/4 local vault already linked — skipping setup"
+  else
+    info "3/4 link local vault (re-enter the same E2EE password)"
+    ob_it sync-setup --vault "$PROJECT"
+  fi
+
+  info "4/4 first sync"
+  ob_run sync
+
+  cmd_start
+  info "setup complete for '$PROJECT'"
+}
+
+cmd_purge() {
+  exists && docker rm -f "$CONTAINER" >/dev/null
+  rm -rf "$CFG"
+  info "purged container + config for '$PROJECT' ($CFG). Vault files left untouched."
+}
+
+# ---- arg parsing ---------------------------------------------------------
+DIR="$PWD"
+if [ "${1:-}" = "-C" ]; then [ -n "${2:-}" ] || die "-C needs a directory"; DIR="$2"; shift 2; fi
+CMD="${1:-help}"; shift || true
+
+case "$CMD" in
+  build) build_image; exit 0 ;;
+  help|-h|--help) awk 'NR>1 && /^#/{sub(/^# ?/,"");print;next} NR>1{exit}' "$0"; exit 0 ;;
+esac
+
+load_project "$DIR"
+
+case "$CMD" in
+  setup)   cmd_setup ;;
+  start)   cmd_start ;;
+  stop)    cmd_stop ;;
+  restart) cmd_stop; cmd_start ;;
+  status)  ob_run sync-status ;;
+  sync)    ob_run sync ;;
+  logs)    cmd_logs ;;
+  login)   ob_it login ;;
+  ob)      [ "$#" -gt 0 ] || die "ob needs a subcommand"; ob_auto "$@" ;;
+  purge)   cmd_purge ;;
+  *)       die "unknown command: $CMD (try 'help')" ;;
+esac
