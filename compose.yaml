@@ -5,7 +5,8 @@ services:
       args:
         OB_VERSION: ${OB_VERSION:-0.0.12}
     image: obsidian-headless:${OB_VERSION:-0.0.12}
-    container_name: obsidian-sync
+    # No container_name: it's static and would collide when the same file is run
+    # for multiple projects via `-p`. Compose derives <project>-obsidian-sync-1.
     restart: unless-stopped
 
     environment:
