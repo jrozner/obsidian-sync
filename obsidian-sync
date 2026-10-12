@@ -56,7 +56,7 @@ EOF
 ensure_image() { docker image inspect "$IMAGE" >/dev/null 2>&1 || build_image; }
 
 # Resolve project context from a directory.
-# Sets: PROJECT REMOTE VAULT CFG CONTAINER USER_SPEC
+# Sets: PROJECT REMOTE VAULT CFG CONTAINER USER_SPEC HOST
 load_project() {
   local dir; dir="$(cd "${1:-$PWD}" 2>/dev/null && pwd -P)" || die "no such directory: ${1:-$PWD}"
   PROJECT="$(basename "$dir")"
@@ -70,6 +70,9 @@ load_project() {
   CFG="$CONFIG_ROOT/$id"
   CONTAINER="obsidian-sync-$id"
   USER_SPEC="$(id -u):$(id -g)"
+  # ob names this device after the hostname; pin it to the host's so version
+  # history doesn't show a new random container id after every restart.
+  HOST="$(uname -n)"; HOST="${HOST%%.*}"
   migrate_legacy "$slug"
   mkdir -p "$VAULT" "$CFG"
   [ -f "$CFG/project-path" ] || printf '%s\n' "$dir" > "$CFG/project-path"
@@ -95,7 +98,7 @@ migrate_legacy() {  # $1: sanitized project name
 
 _run() {  # $1: it|no (allocate a TTY?), rest: ob args
   ensure_image
-  local flags=(--rm --user "$USER_SPEC" -v "$CFG:/config" -v "$VAULT:/vault")
+  local flags=(--rm --user "$USER_SPEC" --hostname "$HOST" -v "$CFG:/config" -v "$VAULT:/vault")
   [ "$1" = it ] && flags+=(-it); shift
   docker run "${flags[@]}" "$IMAGE" "$@"
 }
@@ -111,7 +114,7 @@ cmd_start() {
   if running; then info "$CONTAINER already running"; return; fi
   exists && docker rm -f "$CONTAINER" >/dev/null
   docker run -d --name "$CONTAINER" --restart unless-stopped \
-    --user "$USER_SPEC" -v "$CFG:/config" -v "$VAULT:/vault" \
+    --user "$USER_SPEC" --hostname "$HOST" -v "$CFG:/config" -v "$VAULT:/vault" \
     "$IMAGE" sync --continuous >/dev/null
   info "started $CONTAINER (continuous sync) — follow with: logs"
 }
