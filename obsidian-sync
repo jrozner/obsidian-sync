@@ -3,10 +3,11 @@
 #
 # Convention: each project directory holds its vault in ./wiki, and the remote
 # vault is named after the project directory. All per-project state (login,
-# E2EE key, sync db) lives under ~/.config/obsidian-sync/<project> — outside the
-# project dir, so it never lands in a project's git repo.
+# E2EE key, sync db) lives under ~/.config/obsidian-sync/<project>-<hash>, keyed
+# by the project's full path — outside the project dir, so it never lands in a
+# project's git repo.
 #
-# Usage: obsidian-sync [-C <dir>] <command> [args]
+# Usage: obsidian-sync [-C <dir>] [-n <name>] <command> [args]
 #
 #   setup     one-time: log in, create + link the remote, first sync, start daemon
 #   start     start (or resume) the continuous-sync daemon
@@ -21,6 +22,7 @@
 #   purge     stop the daemon and DELETE this project's config (login/key/state)
 #
 # -C <dir> selects the project directory (default: current directory).
+# -n <name> names the remote vault for setup (default: the directory's name).
 # OB_VERSION env var pins the CLI version (default below).
 
 set -euo pipefail
@@ -53,19 +55,42 @@ EOF
 
 ensure_image() { docker image inspect "$IMAGE" >/dev/null 2>&1 || build_image; }
 
-# Resolve project context from a directory. Sets: PROJECT VAULT CFG CONTAINER USER_SPEC
+# Resolve project context from a directory.
+# Sets: PROJECT REMOTE VAULT CFG CONTAINER USER_SPEC
 load_project() {
-  local dir; dir="$(cd "${1:-$PWD}" 2>/dev/null && pwd)" || die "no such directory: ${1:-$PWD}"
+  local dir; dir="$(cd "${1:-$PWD}" 2>/dev/null && pwd -P)" || die "no such directory: ${1:-$PWD}"
   PROJECT="$(basename "$dir")"
+  REMOTE="${REMOTE_NAME:-$PROJECT}"
   VAULT="$dir/wiki"
-  CFG="$CONFIG_ROOT/$PROJECT"
-  # Docker names allow only [a-zA-Z0-9_.-]; map anything else to '-'.
-  CONTAINER="obsidian-sync-$(printf '%s' "$PROJECT" | tr -c 'a-zA-Z0-9_.-' '-')"
+  # Key local state by the full path so same-named projects in different places
+  # don't share a config or container. Docker names allow only [a-zA-Z0-9_.-].
+  local slug id
+  slug="$(printf '%s' "$PROJECT" | tr -c 'a-zA-Z0-9_.-' '-')"
+  id="$slug-$(printf '%s' "$dir" | sha256sum | cut -c1-8)"
+  CFG="$CONFIG_ROOT/$id"
+  CONTAINER="obsidian-sync-$id"
   USER_SPEC="$(id -u):$(id -g)"
+  migrate_legacy "$slug"
   mkdir -p "$VAULT" "$CFG"
+  [ -f "$CFG/project-path" ] || printf '%s\n' "$dir" > "$CFG/project-path"
   local owner; owner="$(stat -c '%u' "$VAULT")"
   [ "$owner" = "$(id -u)" ] || \
     info "warning: $VAULT is owned by uid $owner but you are uid $(id -u); vault writes may fail — run as the vault owner"
+}
+
+# State used to be keyed by basename alone (<root>/<project>, container
+# obsidian-sync-<project>). Adopt it on first use from a path with that name.
+migrate_legacy() {  # $1: sanitized project name
+  local old="$CONFIG_ROOT/$PROJECT" oldc="obsidian-sync-$1" was_running=false
+  [ ! -e "$CFG" ] && [ -d "$old" ] && [ ! -f "$old/project-path" ] || return 0
+  info "migrating $old -> $CFG"
+  # The old container bind-mounts the old path; recreate it rather than rename.
+  if docker inspect "$oldc" >/dev/null 2>&1; then
+    [ "$(docker inspect -f '{{.State.Running}}' "$oldc")" = true ] && was_running=true
+    docker rm -f "$oldc" >/dev/null
+  fi
+  mv "$old" "$CFG"
+  if $was_running; then cmd_start; fi
 }
 
 _run() {  # $1: it|no (allocate a TTY?), rest: ob args
@@ -103,7 +128,7 @@ cmd_sync() {
 cmd_logs() { exists || die "$CONTAINER does not exist — run 'start' first"; docker logs -f "$CONTAINER"; }
 
 cmd_setup() {
-  info "project '$PROJECT'   vault=$VAULT   config=$CFG"
+  info "project '$PROJECT'   remote=$REMOTE   vault=$VAULT   config=$CFG"
   ensure_image
 
   info "1/4 login (interactive; already-logged-in just prints status)"
@@ -111,21 +136,23 @@ cmd_setup() {
 
   # Capture before grepping: with pipefail, grep -q exiting early can SIGPIPE
   # docker and make the pipeline fail even on a match.
-  local out
-  out="$(ob_run sync-list-remote 2>/dev/null || true)"
-  if grep -qF "\"$PROJECT\"" <<<"$out"; then
-    info "2/4 remote vault '$PROJECT' already exists — skipping create"
-  else
-    info "2/4 create remote vault '$PROJECT' (E2EE — choose a password and save it)"
-    ob_it sync-create-remote --name "$PROJECT" --encryption end-to-end
-  fi
-
+  local out ans
   out="$(ob_run sync-status 2>/dev/null || true)"
   if grep -q 'Vault:' <<<"$out"; then
-    info "3/4 local vault already linked — skipping setup"
+    info "2-3/4 local vault already linked — skipping create + link"
   else
+    out="$(ob_run sync-list-remote 2>/dev/null || true)"
+    if grep -qF "\"$REMOTE\"" <<<"$out"; then
+      # Remote names are account-wide: this may be another project's vault.
+      read -rp "Remote vault '$REMOTE' already exists. Link this project to it? (-n <name> picks another) [y/N] " ans
+      [[ "$ans" == [yY]* ]] || die "aborted — rerun with -n <name> to use a different remote vault"
+      info "2/4 using existing remote vault '$REMOTE'"
+    else
+      info "2/4 create remote vault '$REMOTE' (E2EE — choose a password and save it)"
+      ob_it sync-create-remote --name "$REMOTE" --encryption end-to-end
+    fi
     info "3/4 link local vault (re-enter the same E2EE password)"
-    ob_it sync-setup --vault "$PROJECT"
+    ob_it sync-setup --vault "$REMOTE"
   fi
 
   # ob holds a lock in the vault while syncing, so a one-shot sync would fail
@@ -138,7 +165,7 @@ cmd_setup() {
   fi
 
   cmd_start
-  info "setup complete for '$PROJECT'"
+  info "setup complete for '$PROJECT' (remote '$REMOTE')"
 }
 
 cmd_purge() {
@@ -149,7 +176,14 @@ cmd_purge() {
 
 # ---- arg parsing ---------------------------------------------------------
 DIR="$PWD"
-if [ "${1:-}" = "-C" ]; then [ -n "${2:-}" ] || die "-C needs a directory"; DIR="$2"; shift 2; fi
+REMOTE_NAME=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -C) [ -n "${2:-}" ] || die "-C needs a directory"; DIR="$2"; shift 2 ;;
+    -n) [ -n "${2:-}" ] || die "-n needs a vault name"; REMOTE_NAME="$2"; shift 2 ;;
+    *)  break ;;
+  esac
+done
 CMD="${1:-help}"; shift || true
 
 case "$CMD" in
