@@ -25,7 +25,7 @@
 
 set -euo pipefail
 
-OB_VERSION="${OB_VERSION:-0.0.12}"
+OB_VERSION="${OB_VERSION:-0.0.14}"
 IMAGE="obsidian-sync:${OB_VERSION}"
 CONFIG_ROOT="${OBSIDIAN_SYNC_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/obsidian-sync}"
 
@@ -59,7 +59,8 @@ load_project() {
   PROJECT="$(basename "$dir")"
   VAULT="$dir/wiki"
   CFG="$CONFIG_ROOT/$PROJECT"
-  CONTAINER="obsidian-sync-$PROJECT"
+  # Docker names allow only [a-zA-Z0-9_.-]; map anything else to '-'.
+  CONTAINER="obsidian-sync-$(printf '%s' "$PROJECT" | tr -c 'a-zA-Z0-9_.-' '-')"
   USER_SPEC="$(id -u):$(id -g)"
   mkdir -p "$VAULT" "$CFG"
   local owner; owner="$(stat -c '%u' "$VAULT")"
@@ -94,6 +95,11 @@ cmd_stop() {
   if exists; then docker rm -f "$CONTAINER" >/dev/null; info "stopped $CONTAINER"; else info "$CONTAINER not running"; fi
 }
 
+cmd_sync() {
+  running && die "$CONTAINER is running and already syncing continuously — 'stop' it first for a one-shot sync"
+  ob_run sync
+}
+
 cmd_logs() { exists || die "$CONTAINER does not exist — run 'start' first"; docker logs -f "$CONTAINER"; }
 
 cmd_setup() {
@@ -103,22 +109,33 @@ cmd_setup() {
   info "1/4 login (interactive; already-logged-in just prints status)"
   ob_it login
 
-  if ob_run sync-list-remote 2>/dev/null | grep -q "\"$PROJECT\""; then
+  # Capture before grepping: with pipefail, grep -q exiting early can SIGPIPE
+  # docker and make the pipeline fail even on a match.
+  local out
+  out="$(ob_run sync-list-remote 2>/dev/null || true)"
+  if grep -qF "\"$PROJECT\"" <<<"$out"; then
     info "2/4 remote vault '$PROJECT' already exists — skipping create"
   else
     info "2/4 create remote vault '$PROJECT' (E2EE — choose a password and save it)"
-    ob_it sync-create-remote --name "$PROJECT" --encryption e2ee
+    ob_it sync-create-remote --name "$PROJECT" --encryption end-to-end
   fi
 
-  if ob_run sync-status 2>/dev/null | grep -q 'Vault:'; then
+  out="$(ob_run sync-status 2>/dev/null || true)"
+  if grep -q 'Vault:' <<<"$out"; then
     info "3/4 local vault already linked — skipping setup"
   else
     info "3/4 link local vault (re-enter the same E2EE password)"
     ob_it sync-setup --vault "$PROJECT"
   fi
 
-  info "4/4 first sync"
-  ob_run sync
+  # ob holds a lock in the vault while syncing, so a one-shot sync would fail
+  # against a running daemon.
+  if running; then
+    info "4/4 daemon already running — skipping first sync"
+  else
+    info "4/4 first sync"
+    ob_run sync
+  fi
 
   cmd_start
   info "setup complete for '$PROJECT'"
@@ -148,7 +165,7 @@ case "$CMD" in
   stop)    cmd_stop ;;
   restart) cmd_stop; cmd_start ;;
   status)  ob_run sync-status ;;
-  sync)    ob_run sync ;;
+  sync)    cmd_sync ;;
   logs)    cmd_logs ;;
   login)   ob_it login ;;
   ob)      [ "$#" -gt 0 ] || die "ob needs a subcommand"; ob_auto "$@" ;;

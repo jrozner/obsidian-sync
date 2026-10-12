@@ -85,7 +85,7 @@ The image definition lives in the script's `build_image()` function.
   curl -s https://registry.npmjs.org/obsidian-headless | \
     python3 -c 'import sys,json; print(json.load(sys.stdin)["dist-tags"])'
 
-  OB_VERSION=0.0.13 obsidian-sync -C ~/vuln-research/whoop restart
+  OB_VERSION=0.0.15 obsidian-sync -C ~/vuln-research/whoop restart
   ```
 
   Or change the `OB_VERSION` default at the top of the script.
